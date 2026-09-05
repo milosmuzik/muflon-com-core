@@ -1,0 +1,91 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Co appka dělá
+
+**Muflon Com Core** — anglická obdoba [Muflon Core](https://github.com/milosmuzik/muflon-core), znalostní systém pro redakční práci na anglické mutaci Rádia Muflon (radiomuflon.com, vlastní stream na zeno.fm, stávající playlist Rádia Muflon minus české kapely). Stejná architektura jako CZ Core — postaveno podle „Muflon Core Bible". Pokrývá Etapu 1 (interpreti, hudebníci, alba, skladby, vazby, zdroje), Etapu 2 (příběhy, události, historie změn, propojení), redakční workflow (Etapa 3) a Muflonní kalendář (Etapa 4). Na rozdíl od CZ Core je tu Etapa 5 (AI asistent, viz "AI integrace" níže) od začátku aktivní — Gemini dělá většinu redakční rutiny (dohledávání zdrojů, návrhy kalendáře, doplňování katalogu) samostatně.
+
+Karty se píšou/generují přímo anglicky, nezávisle na CZ Core — žádná migrace ani synchronizace dat mezi projekty. Redakční UI zůstává česky (interní nástroj), veřejný obsah (karty, kalendář, sociální posty) anglicky.
+
+**Princip datového modelu:** objekt + vlastnosti + vztahy + zdroje + historie = znalost.
+
+**Důležité pravidlo z Bible:** „Nejdříve se mění Bible. Teprve potom se mění software" — při rozšiřování domény napřed patří odpovídající kapitola do Muflon Core Bible, teprve pak implementace.
+
+## Příkazy
+
+```bash
+npm install
+cp .env.example .env      # vlož skutečný DATABASE_URL
+npm run db:push           # aplikuje prisma/schema.prisma na databázi (bez migrací)
+npm run db:seed           # naimportuje prisma/data/playlist.tsv (interpreti + skladby)
+npm run dev                # http://localhost:3000
+npm run build              # produkční build (next build)
+npm run lint                # next lint
+npm run db:studio          # Prisma Studio — vizuální prohlížeč dat
+```
+
+Žádný testovací framework/skripty v projektu nejsou. `postinstall` automaticky pouští `prisma generate`.
+
+Jednorázové/ladicí skripty se spouští přímo přes `tsx`, např. `npx tsx prisma/import-batch.ts` nebo `npx tsx pridat-skladby.ts` — `prisma/` obsahuje historii jednorázových importních/opravných skriptů (import konkrétních interpretů, slučování duplicit, diagnostiku), které slouží jako reference, ne jako opakovaně spouštěný kód.
+
+## Architektura
+
+**Next.js 14 App Router**, jedna sekce (route + Server Component page) na entitu pod `app/` (`interpreti/`, `hudebnici/`, `alba/`, `skladby/`, `pribehy/`, `udalosti/`, `kalendar/`, `hledat/`, `kontrola/`, `import/`). Mutace jdou přes Server Actions (`"use server"`) v `lib/actions/`, jeden soubor na entitu + `spolecne.ts` pro sdílené operace napříč entitami.
+
+### Datový model (`prisma/schema.prisma`)
+
+Centrální uzel je **Interpret** (kapela/projekt), napojený na:
+- **Hudebnik** (fyzická osoba) přes join model **Clenstvi** — kariéra hudebníka je historie těchto vztahů, ne pole na entitě.
+- **Album** a **Skladba** přes join modely `AlbumInterpret` / `SkladbaInterpret` (M:N).
+- **Skladba** může mít `puvodniVerzeId` (odkaz na jinou Skladbu — cover/remaster jsou samostatné entity, ne verze jedné).
+
+Napříč entitami fungují tři polymorfní modely (identifikace přes `cilovyTyp`/`cilovyId` stringy, ne relace v DB):
+- **Zdroj** — ověřitelnost; `kategorie` má pevnou hierarchii důvěryhodnosti definovanou v `lib/constants.ts` (`KATEGORIE_ZDROJE`, priorita 1 = nejdůvěryhodnější).
+- **Vazba** — obecná hrana znalostní sítě mezi libovolnými dvěma objekty (`zdrojovyTyp/Id` → `cilovyTyp/Id`).
+- **HistorieZmeny** — audit log; každá mutace v `lib/actions/` po sobě volá `zapisHistorii()` z `lib/history.ts`.
+
+**Pribeh** a **Udalost** mají redakční `stav` workflow: `navrh → overeno → schvaleno → publikovano → archivovano` (posloupnost v `DALSI_STAV`, `lib/constants.ts`; posun přes `posunoutStav()` v `lib/actions/spolecne.ts`). **Interpret** má samostatný, jednodušší `urovenKarty` stav.
+
+Při přidávání nové entity, která má mít zdroje/vazby/historii, ji stačí zapojit do `switch` větví v `najdiIdPodleNazvu()` a `nazevObjektu()` (`lib/actions/spolecne.ts`) a přidat do `TYPY_ENTIT` (`lib/constants.ts`) — zbytek (UI komponenty `ZdrojeSekce`, `VazbySekce`, `HistorieSekce`) je generický.
+
+### Slučování duplicit
+
+`lib/actions/slouceni.ts` řeší merge dvou záznamů stejného typu (typicky Interpret): doplní chybějící pole z mazaného záznamu do ponechaného (`SLUCITELNA_POLE`), přepojí všechny join tabulky a polymorfní odkazy (Zdroj, Vazba, HistorieZmeny) na `ponechatId`, teprve pak smaže duplicitu — vše v jedné `prisma.$transaction`.
+
+### AI integrace (Gemini)
+
+Tři nezávislé agentní funkce, všechny volají Gemini REST API přímo (`fetch`, model `gemini-flash-lite-latest`), bez SDK:
+- **`lib/agent/import-karty.ts`** — extrahuje strukturovaná data z neformátovaného textu „referenční karty" do JSON (interpret + členové + alba + události + příběhy + zdroje). Vstupní bod je chráněný endpoint `app/api/admin/import-karty/route.ts` (auth přes `X-Import-Key` header proti `IMPORT_API_KEY`), který volá MCP server (`import_muflon_karty`) — **nikdy ho nedávej veřejně bez klíče**.
+- **`lib/agent/navrhy-kalendar.ts`** — denně (cron) generuje návrhy kalendářních událostí přes Gemini s `google_search` tool, s vynucenou hierarchií důvěryhodnosti zdrojů (stejná jako `KATEGORIE_ZDROJE`). Vstupní bod `app/api/cron/navrhy-kalendar/route.ts`, auth přes `Authorization: Bearer $CRON_SECRET`.
+- **`lib/agent/zjisti-vice.ts`** — doplňkové obohacení dat (viz `npm run enrich:hudebnici`).
+
+Všechny tři AI funkce parsují odpověď Gemini jako "vrať POUZE JSON, žádný markdown" a mají fallback na extrakci JSON mezi první `{`/`[` a poslední `}`/`]` pro případ, že model přesto markdown přidá.
+
+**Jazyk výstupu:** samotné prompty zůstávají česky (interní instrukce), ale každý prompt, který nechává Gemini něco sám formulovat (`popis` v `navrhy-kalendar.ts`, `poznamka` v `doplnit-katalog.ts`, `rozsireni` v `zjisti-vice.ts`), obsahuje explicitní instrukci psát tahle pole anglicky — je to obsah pro veřejný web radiomuflon.com. `import-karty.ts` je čistá extrakce z už napsaného textu (nemění jazyk vstupu), `dohledat-zdroj.ts` jen hledá zdroj (název zdroje se nepřekládá). Při přidávání dalšího Gemini promptu, který generuje nový text (ne extrakci ani název zdroje), přidej stejnou instrukci.
+
+Navíc `.github/workflows/gemini-bot.yml` — GitHub Actions bot spouštěný komentářem `/gemini <úkol>` na issue, který zavolá Gemini přímo a otevře PR se změnami. Samotná logika je v `.github/scripts/gemini_bot.py` (workflow soubor jen definuje spouštěč a kroky). Vyžaduje repo secret `GEMINI_API_KEY` (Settings → Secrets and variables → Actions) a povolené "Allow GitHub Actions to create and approve pull requests" v Settings → Actions → General.
+
+### Sociální sítě
+
+`lib/socialni/facebook.ts` a `lib/socialni/instagram.ts` — publikace na Facebook/Instagram (přes `FACEBOOK_PAGE_ACCESS_TOKEN`, `FACEBOOK_PAGE_ID`, `INSTAGRAM_ACCOUNT_ID`), stav se eviduje v modelu **Publikace**. `app/api/socialni/obrazek/[id]/route.tsx` generuje obrázek pro post (Next.js OG image).
+
+## Proměnné prostředí
+
+| Proměnná | Účel |
+|---|---|
+| `DATABASE_URL` | Prisma → PostgreSQL (Vercel Postgres / Neon) |
+| `GEMINI_API_KEY` | AI import karet, návrhy kalendáře, enrichment |
+| `CRON_SECRET` | autorizace `app/api/cron/*` |
+| `IMPORT_API_KEY` | autorizace `app/api/admin/import-karty` |
+| `NEXT_PUBLIC_APP_URL` | základ pro absolutní URL (default `https://muflon-com-core.vercel.app`) |
+| `FACEBOOK_PAGE_ACCESS_TOKEN`, `FACEBOOK_PAGE_ID`, `INSTAGRAM_ACCOUNT_ID` | publikace na sociální sítě — vlastní anglický FB/IG účet, jiný než CZ Core |
+| `X_API_KEY`, `X_API_SECRET`, `X_ACCESS_TOKEN`, `X_ACCESS_TOKEN_SECRET` | volitelná publikace na X/Twitter (`lib/socialni/x.ts`) — u CZ Core se zatím nepoužívá (vědomě vynechán, jen FB+IG), kód ale existuje |
+
+## Časové pásmo
+
+Uživatel je v Praze. Kdykoliv se v komunikaci s ním nebo při plánování (crony ve `vercel.json`, Claude Code Remote Routines/triggery) mluví o čase bez výslovně uvedeného pásma, myslí se `Europe/Prague` — a to VČETNĚ respektování letního času (CEST = UTC+2 zhruba konec března – konec října, CET = UTC+1 jinak). Při zadávání `cron_expression` (ten se vždy vyhodnocuje v UTC) je proto nutné nejdřív převést požadovaný pražský čas na UTC podle offsetu, který právě platí k datu, kdy je pravidlo nastavováno/aktuální — ne podle pevně zafixovaného +1 nebo +2.
+
+## Styl
+
+Tailwind s vlastní barevnou paletou (`bg-raised`, `text-muted`, `border-line`, `bg-sage`, `bg-accent`, `bg-rust` — viz `tailwind.config.ts` / `app/globals.css`), používanou konzistentně napříč `STAV_BARVA` a komponentami. Texty v redakčním UI i komentářích jsou česky, identifikátory (modely, pole, funkce) taktéž — drž se toho i v novém kódu. Výjimka je obsah, který uvidí čtenář webu radiomuflon.com (karty interpretů, kalendářní události, sociální posty, generovaný obrázek v `app/api/socialni/obrazek/`) — ten je vždy anglicky.

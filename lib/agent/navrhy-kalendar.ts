@@ -1,0 +1,137 @@
+import { prisma } from "@/lib/prisma";
+import { zapisHistorii } from "@/lib/history";
+import {
+  AUTOSCHVALENI_OD_UROVNE,
+  POZNAMKA_AI_NAVRH_KALENDAR,
+  nazevZeZdroje,
+  urovenDuveryPriorita,
+  urovenDuveryZeZdroje,
+} from "@/lib/constants";
+import { rozbalRedirect } from "./redirect";
+import { jsouDuplicitni } from "./duplicity";
+import { GeminiQuotaError, geminiJeDostupne, jeKvotaChyba, vytahniJson, zavolejGemini } from "./gemini";
+
+const NAZVY_MESICU_2P = [
+  "ledna", "února", "března", "dubna", "května", "června",
+  "července", "srpna", "září", "října", "listopadu", "prosince",
+];
+
+type NavrzenaUdalost = {
+  nazev: string;
+  typ: "vyroci_alba" | "narozeniny" | "umrti" | "jina";
+  popis: string;
+  zdroje: { nazev: string; url: string; kategorie: string }[];
+};
+
+const PLATNE_KATEGORIE = new Set([
+  "oficialni_web", "socialni_site", "archivni", "databaze", "media", "rozhovor", "kniha", "orientacni",
+]);
+
+function sestavPrompt(den: number, mesic: number): string {
+  const datumText = `${den}. ${NAZVY_MESICU_2P[mesic - 1]}`;
+  return `Jsi redakční asistent hudební databáze Rádio Muflon (zaměření: rock a metal). Najdi ověřitelné hudební historické události vázané přesně na kalendářní datum ${datumText} (libovolný rok) – narození nebo úmrtí hudebníků, výročí založení kapel, výročí vydání alb, nebo zajímavosti (např. co se stalo na konkrétním koncertu tento den).
+
+Použij web search a dodržuj tuto hierarchii důvěryhodnosti zdrojů (nejvyšší priorita první): 1) oficiální web interpreta, 2) oficiální sociální sítě, 3) renomované hudební databáze/encyklopedie (Metal Archives/Encyclopaedia Metallum, AllMusic, Rate Your Music, Metal Storm), 4) dlouhodobě zavedená hudební média (Decibel, BraveWords, Kerrang!, Metal Hammer, Rock Hard, Spark Rock Magazine, Rock&Pop, BURRN!, Blabbermouth, Loudwire, Metal Injection, Angry Metal Guy, Revolver), 5) bookletky/tiskoviny/archivy, 6) rozhovory/ověřená videa, 7) knihy/biografie. Wikipedii, fanouškovské weby a obecné databáze mimo výše uvedený seznam (Discogs, MusicBrainz) používej jen jako orientační bod, ne jako hlavní zdroj v odpovědi. Preferuj zdroje z bodů 1–4 – ty jediné stačí samy o sobě k automatickému schválení.
+
+DŮLEŽITÉ: pole "nazev" a "popis" piš v ANGLIČTINĚ (jazyk cílového webu radiomuflon.com) - i když je tenhle prompt v češtině. Pole "nazev" u zdroje nech tak, jak zdroj skutečně nazývá sám sebe (nepřekládej název média/webu).
+
+Vrať POUZE JSON pole (žádný text okolo, žádné markdown zpětné uvozovky) s max. 3 nejzajímavějšími a nejjistějšími položkami. Pokud nic ověřitelného nenajdeš, vrať prázdné pole []. Formát každé položky:
+{"nazev": "short English title (max 60 characters)", "typ": "vyroci_alba|narozeniny|umrti|jina", "popis": "2-3 sentences in English, in your own words, editorially phrased, not copied", "zdroje": [{"nazev": "název zdroje", "url": "https://...", "kategorie": "jedna z: oficialni_web|socialni_site|archivni|databaze|media|rozhovor|kniha|orientacni"}]}
+
+Každá položka MUSÍ mít alespoň jeden zdroj se skutečnou, dohledatelnou URL. Bez zdroje položku vynech.`;
+}
+
+function vytahniPole(text: string): NavrzenaUdalost[] {
+  const parsed = vytahniJson(text);
+  return Array.isArray(parsed) ? parsed : [];
+}
+
+export type VysledekAgenta = {
+  zpracovanoDni: number;
+  navrzeno: number;
+  preskoceno: number;
+  bezDostatecnehoZdroje: number;
+  chyby: string[];
+};
+
+export async function vygenerovatNavrhyKalendare(pocetDni = 7): Promise<VysledekAgenta> {
+  if (!geminiJeDostupne()) throw new GeminiQuotaError("Chybí GEMINI_API_KEY nebo je kvóta vyčerpaná.");
+
+  let navrzeno = 0;
+  let preskoceno = 0;
+  let bezDostatecnehoZdroje = 0;
+  const chyby: string[] = [];
+
+  for (let i = 0; i < pocetDni; i++) {
+    const datum = new Date();
+    datum.setDate(datum.getDate() + i);
+    const den = datum.getDate();
+    const mesic = datum.getMonth() + 1;
+    const mmdd = `${String(mesic).padStart(2, "0")}-${String(den).padStart(2, "0")}`;
+    try {
+      const surovaOdpoved = await zavolejGemini(sestavPrompt(den, mesic), true);
+      const polozky = vytahniPole(surovaOdpoved);
+      for (const polozka of polozky) {
+        if (!polozka.nazev || !polozka.zdroje?.length) continue;
+        const existujiciTentoDen = await prisma.udalost.findMany({ where: { datum: mmdd }, select: { nazev: true } });
+        if (existujiciTentoDen.some((u) => jsouDuplicitni(u.nazev, polozka.nazev))) {
+          preskoceno++;
+          continue;
+        }
+        const typ = ["vyroci_alba", "narozeniny", "umrti", "jina"].includes(polozka.typ) ? polozka.typ : "jina";
+        const vyhodnoceneZdroje: { nazev: string; url: string; kategorie: string; uroverDuvery: string }[] = [];
+        let nejvyssiUroven = 0;
+        for (const zdroj of polozka.zdroje.slice(0, 5)) {
+          if (!zdroj.url) continue;
+          const skutecnaUrl = await rozbalRedirect(zdroj.url);
+          const kategorie = PLATNE_KATEGORIE.has(zdroj.kategorie) ? zdroj.kategorie : "orientacni";
+          const uroverDuvery = urovenDuveryZeZdroje(kategorie, skutecnaUrl);
+          nejvyssiUroven = Math.max(nejvyssiUroven, urovenDuveryPriorita(uroverDuvery));
+          vyhodnoceneZdroje.push({
+            nazev: nazevZeZdroje(skutecnaUrl, zdroj.nazev || "Zdroj"),
+            url: skutecnaUrl,
+            kategorie,
+            uroverDuvery,
+          });
+        }
+        if (nejvyssiUroven < AUTOSCHVALENI_OD_UROVNE) {
+          bezDostatecnehoZdroje++;
+          continue;
+        }
+        const novaUdalost = await prisma.udalost.create({
+          data: {
+            nazev: polozka.nazev.slice(0, 200),
+            typ,
+            datum: mmdd,
+            opakujeSe: true,
+            popis: polozka.popis ?? null,
+            stav: "schvaleno",
+            zdrojAI: true,
+            zverejnitNaSitich: false,
+          },
+        });
+        for (const zdroj of vyhodnoceneZdroje) {
+          await prisma.zdroj.create({
+            data: {
+              cilovyTyp: "Udalost",
+              cilovyId: novaUdalost.id,
+              nazev: zdroj.nazev,
+              url: zdroj.url,
+              kategorie: zdroj.kategorie,
+              uroverDuvery: zdroj.uroverDuvery,
+              poznamka: POZNAMKA_AI_NAVRH_KALENDAR,
+            },
+          });
+        }
+        await zapisHistorii("Udalost", novaUdalost.id, "vytvoreno", "Navrženo AI agentem (web search)");
+        await zapisHistorii("Udalost", novaUdalost.id, "zmena_stavu", "Automaticky schváleno – nejméně jeden zdroj s dostatečnou důvěrou");
+        navrzeno++;
+      }
+    } catch (e) {
+      chyby.push(`${mmdd}: ${(e as Error).message}`);
+      if (jeKvotaChyba(e)) break;
+    }
+  }
+
+  return { zpracovanoDni: pocetDni, navrzeno, preskoceno, bezDostatecnehoZdroje, chyby };
+}

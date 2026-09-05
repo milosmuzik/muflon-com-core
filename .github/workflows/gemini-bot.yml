@@ -1,0 +1,46 @@
+name: Gemini Bot
+
+# Spouští se komentářem "/gemini <úkol>" na libovolném issue v repozitáři.
+# Zavolá Gemini, výstup rozparsuje na soubory, založí větev, commitne,
+# pushne a otevře Pull Request s výsledkem. Viz .github/scripts/gemini_bot.py
+# pro samotnou logiku - tady je jen "kdy a čím to spustit".
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  gemini-task:
+    # Jen komentáře na issues (ne na PR - github posílá issue_comment i pro
+    # komentáře pod PR) a jen když komentář fakticky začíná "/gemini".
+    if: >
+      github.event.issue.pull_request == null &&
+      startsWith(github.event.comment.body, '/gemini')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repozitáře
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Nastavit Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalovat závislosti
+        run: pip install --quiet --upgrade google-genai PyGithub
+
+      - name: Spustit Gemini a otevřít Pull Request
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          REPO_FULL_NAME: ${{ github.repository }}
+        run: python3 .github/scripts/gemini_bot.py
